@@ -43,6 +43,7 @@ type MachineConfig struct {
 
 	SSH    *SSH   `yaml:"ssh,omitempty"`
 	Engine Engine `yaml:"engine,omitempty"`
+	Arch   string `yaml:"arch,omitempty"`
 
 	OnFailure func(*process.Process)
 }
@@ -63,6 +64,7 @@ func DefaultMachineConfig() *MachineConfig {
 		SSH:            &SSH{},
 		CPU:            "2",
 		Memory:         "2048",
+		Arch:           "x86_64",
 	}
 }
 
@@ -239,6 +241,15 @@ func WithStateDir(dir string) MachineOption {
 	return func(mc *MachineConfig) error {
 		if dir != "" {
 			mc.StateDir = dir
+		}
+		return nil
+	}
+}
+
+func WithArch(arch string) MachineOption {
+	return func(mc *MachineConfig) error {
+		if arch != "" {
+			mc.Arch = arch
 		}
 		return nil
 	}

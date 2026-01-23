@@ -24,27 +24,28 @@ type QEMU struct {
 }
 
 // findQEMUBinary searches for qemu-system-x86_64 in common installation paths
-func findQEMUBinary() (string, error) {
+func findQEMUBinary(arch string) (string, error) {
+	qemuBinary := fmt.Sprintf("qemu-system-%s", arch)
 	// Common paths where QEMU might be installed
 	commonPaths := []string{
-		"/home/linuxbrew/.linuxbrew/bin/qemu-system-x86_64", // Homebrew on Linux
-		"/usr/local/bin/qemu-system-x86_64",                 // Manual install
-		"/usr/bin/qemu-system-x86_64",                       // System package
-		"/opt/homebrew/bin/qemu-system-x86_64",              // Homebrew on macOS ARM
-		"/usr/local/homebrew/bin/qemu-system-x86_64",        // Homebrew on macOS Intel
+		"/home/linuxbrew/.linuxbrew/bin/", // Homebrew on Linux
+		"/usr/local/bin/",                 // Manual install
+		"/usr/bin/",                       // System package
+		"/opt/homebrew/bin/",              // Homebrew on macOS ARM
+		"/usr/local/homebrew/bin/",        // Homebrew on macOS Intel
 	}
 
 	// Check each common path first
 	for _, path := range commonPaths {
-		if _, err := os.Stat(path); err == nil {
-			return path, nil
+		if _, err := os.Stat(filepath.Join(path, qemuBinary)); err == nil {
+			return filepath.Join(path, qemuBinary), nil
 		}
 	}
 
 	// Fallback to searching in PATH
-	path, err := exec.LookPath("qemu-system-x86_64")
+	path, err := exec.LookPath(qemuBinary)
 	if err != nil {
-		return "", fmt.Errorf("qemu-system-x86_64 not found in common paths or PATH: %w", err)
+		return "", fmt.Errorf("%s not found in common paths or PATH: %w", qemuBinary, err)
 	}
 
 	return path, nil
@@ -67,17 +68,54 @@ func (q *QEMU) Create(ctx context.Context) (context.Context, error) {
 	}
 
 	genDrives := func(m types.MachineConfig) []string {
-		allDrives := []string{}
-		if m.ISO != "" {
-			allDrives = append(allDrives, "-drive", fmt.Sprintf("if=ide,media=cdrom,file=%s", m.ISO))
+		var allDrives []string
+		scsiAdded := false
+		id := 0
+
+		// User disks: bootindex 1..N (highest priority)
+		for i, d := range userDrives {
+			driveID := fmt.Sprintf("drv%d", id)
+			id++
+
+			allDrives = append(allDrives,
+				"-drive", fmt.Sprintf("if=none,id=%s,file=%s", driveID, d),
+				"-device", fmt.Sprintf("virtio-blk-pci,drive=%s,bootindex=%d", driveID, i+1),
+			)
 		}
-		if m.DataSource != "" {
-			allDrives = append(allDrives, "-drive", fmt.Sprintf("if=ide,media=cdrom,file=%s", m.DataSource))
-		}
-		if len(userDrives) != 0 {
-			for _, d := range userDrives {
-				allDrives = append(allDrives, "-drive", fmt.Sprintf("if=virtio,media=disk,file=%s", d))
+
+		// If we have any CDROMs we want them as /dev/srX => add a virtio-scsi controller once
+		addSCSIIfNeeded := func() {
+			if !scsiAdded {
+				// create a virtio SCSI controller
+				allDrives = append(allDrives,
+					"-device", "virtio-scsi-pci,id=scsi0",
+				)
+				scsiAdded = true
 			}
+		}
+
+		// Primary ISO -> appear as /dev/srX (scsi-cd)
+		if m.ISO != "" {
+			addSCSIIfNeeded()
+			driveID := fmt.Sprintf("drv%d", id)
+			id++
+
+			allDrives = append(allDrives,
+				"-drive", fmt.Sprintf("if=none,id=%s,media=cdrom,file=%s", driveID, m.ISO),
+				"-device", fmt.Sprintf("scsi-cd,drive=%s,bus=scsi0.0,bootindex=50", driveID),
+			)
+		}
+
+		// Data-source ISO -> also /dev/srX
+		if m.DataSource != "" {
+			addSCSIIfNeeded()
+			driveID := fmt.Sprintf("drv%d", id)
+			id++
+
+			allDrives = append(allDrives,
+				"-drive", fmt.Sprintf("if=none,id=%s,media=cdrom,file=%s", driveID, m.DataSource),
+				"-device", fmt.Sprintf("scsi-cd,drive=%s,bus=scsi0.0,bootindex=60", driveID),
+			)
 		}
 
 		return allDrives
@@ -88,7 +126,7 @@ func (q *QEMU) Create(ctx context.Context) (context.Context, error) {
 		processName = q.machineConfig.Process
 	} else {
 		var err error
-		processName, err = findQEMUBinary()
+		processName, err = findQEMUBinary(q.machineConfig.Arch)
 		if err != nil {
 			return ctx, fmt.Errorf("failed to find QEMU binary: %w", err)
 		}
@@ -129,9 +167,28 @@ func (q *QEMU) Create(ctx context.Context) (context.Context, error) {
 
 	if q.machineConfig.CPUType != "" {
 		opts = append(opts, "-cpu", q.machineConfig.CPUType)
+	} else if q.machineConfig.Arch == "aarch64" {
+		// For aarch64, set a default CPU type if not specified
+		opts = append(opts, "-cpu", "max")
 	}
 
 	opts = append(opts, q.machineConfig.Args...)
+
+	if q.machineConfig.Arch == "aarch64" {
+		// For aarch64, we need to specify machine type and firmware
+		opts = append(opts,
+			"-machine", "virt,accel=tcg,acpi=on,gic-version=2",
+		)
+	}
+
+	// Use QEMU boot order "dc" (disk, then cdrom). This works in conjunction with
+	// per-drive bootindex values: 1-N for disks, 50 for ISO, and 60 for the
+	// cloud-init/DataSource drive. The boot order ensures disks are considered
+	// first, while bootindex controls the precedence among multiple devices of
+	// the same type.
+	opts = append(opts, "-boot", "order=dc,menu=on")
+
+	log.Infof("Creating QEMU machine with args: %s", strings.Join(append(opts, genDrives(q.machineConfig)...), " "))
 
 	qemu := process.New(
 		process.WithName(processName),
@@ -143,7 +200,6 @@ func (q *QEMU) Create(ctx context.Context) (context.Context, error) {
 	q.process = qemu
 
 	newCtx := monitor(ctx, qemu, q.machineConfig.OnFailure)
-
 	return newCtx, qemu.Run()
 }
 

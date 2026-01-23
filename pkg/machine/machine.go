@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,7 +31,7 @@ func prepare(mc *types.MachineConfig) error {
 	}
 
 	if mc.StateDir == "" {
-		f, err := ioutil.TempDir("", "peg")
+		f, err := os.MkdirTemp("", "peg")
 		if err != nil {
 			return err
 		}

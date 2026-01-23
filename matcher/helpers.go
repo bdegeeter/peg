@@ -258,10 +258,18 @@ func machineEventuallyConnects(m types.Machine, t ...int) {
 	if len(t) > 0 {
 		dur = t[0]
 	}
+	var lastPrint time.Time
 	Eventually(func() string {
+		// Every 30 seconds print a message to show progress
+		now := time.Now()
+		if lastPrint.IsZero() || now.Sub(lastPrint) >= 30*time.Second {
+			fmt.Println("Still trying to connect...")
+			lastPrint = now
+		}
+
 		out, _ := m.Command("echo ping")
 		return out
-	}, time.Duration(time.Duration(dur)*time.Second), time.Duration(5*time.Second)).Should(Equal("ping\n"))
+	}, time.Duration(dur)*time.Second, 5*time.Second).Should(Equal("ping\n"), "Machine did not become reachable in time")
 }
 
 func machineReboot(m types.Machine, t ...int) {
