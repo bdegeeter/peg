@@ -55,6 +55,11 @@ func (vm VM) Reboot(t ...int) {
 	machineReboot(vm.machine, t...)
 }
 
+// HardReset performs an abrupt power cycle via the hypervisor.
+func (vm VM) HardReset(ctx context.Context) error {
+	return vm.machine.HardReset(ctx)
+}
+
 func (vm VM) DetachCD() error {
 	return vm.machine.DetachCD()
 }

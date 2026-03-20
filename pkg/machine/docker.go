@@ -52,6 +52,10 @@ func (q *Docker) Stop() error {
 	return nil
 }
 
+func (q *Docker) HardReset(_ context.Context) error {
+	return fmt.Errorf("HardReset not supported for Docker engine")
+}
+
 func (q *Docker) Clean() error {
 	out, err := utils.SH(fmt.Sprintf("%s rm %s", q.whereIsDocker(), q.machineConfig.ID))
 	if err != nil {

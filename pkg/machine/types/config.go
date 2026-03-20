@@ -52,11 +52,15 @@ type MachineConfig struct {
 }
 
 // ProxmoxConfig holds configuration specific to the Proxmox VE backend.
+// Authentication: use either TokenID+TokenSecret (API token) or Username+Password (root login).
+// Root login is required for VM features like custom QEMU args.
 type ProxmoxConfig struct {
 	APIURL      string `yaml:"apiURL,omitempty"`
 	Node        string `yaml:"node,omitempty"`
 	TokenID     string `yaml:"tokenID,omitempty"`
 	TokenSecret string `yaml:"tokenSecret,omitempty"`
+	Username    string `yaml:"username,omitempty"` // e.g., "root@pam"
+	Password    string `yaml:"password,omitempty"`
 	Storage     string `yaml:"storage,omitempty"` // e.g., "local-lvm"
 	Bridge      string `yaml:"bridge,omitempty"`  // SDN VNet bridge, e.g., "vnet1"
 	Zone        string `yaml:"zone,omitempty"`    // SDN zone, e.g., "nat-zone"
@@ -418,6 +422,30 @@ func WithProxmoxZone(zone string) MachineOption {
 		}
 		if zone != "" {
 			mc.Proxmox.Zone = zone
+		}
+		return nil
+	}
+}
+
+func WithProxmoxUsername(username string) MachineOption {
+	return func(mc *MachineConfig) error {
+		if mc.Proxmox == nil {
+			mc.Proxmox = &ProxmoxConfig{}
+		}
+		if username != "" {
+			mc.Proxmox.Username = username
+		}
+		return nil
+	}
+}
+
+func WithProxmoxPassword(password string) MachineOption {
+	return func(mc *MachineConfig) error {
+		if mc.Proxmox == nil {
+			mc.Proxmox = &ProxmoxConfig{}
+		}
+		if password != "" {
+			mc.Proxmox.Password = password
 		}
 		return nil
 	}

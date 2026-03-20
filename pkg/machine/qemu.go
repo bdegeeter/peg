@@ -257,6 +257,34 @@ func (q *QEMU) Stop() error {
 	return process.New(process.WithStateDir(q.machineConfig.StateDir)).Stop()
 }
 
+func (q *QEMU) HardReset(_ context.Context) error {
+	sockPath := q.monitorSockFile()
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		return fmt.Errorf("failed to connect to QEMU monitor: %w", err)
+	}
+	defer conn.Close()
+
+	// Drain the welcome banner
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 4096)
+	_, _ = conn.Read(buf)
+
+	// Send system_reset — immediate CPU reset, no graceful shutdown
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	cmd := "system_reset\r\n"
+	if _, err := fmt.Fprint(conn, cmd); err != nil {
+		return fmt.Errorf("failed to send system_reset: %w", err)
+	}
+
+	// Read response to ensure command was processed
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	resp := make([]byte, 1024)
+	_, _ = conn.Read(resp)
+
+	return nil
+}
+
 func (q *QEMU) Clean() error {
 	if q.machineConfig.StateDir != "" {
 		return os.RemoveAll(q.machineConfig.StateDir)

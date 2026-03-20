@@ -25,6 +25,10 @@ func (v *VBox) Config() types.MachineConfig {
 	return v.machineConfig
 }
 
+func (v *VBox) HardReset(_ context.Context) error {
+	return fmt.Errorf("HardReset not supported for VBox engine")
+}
+
 func (v *VBox) Clean() error {
 	if out, err := utils.SH(fmt.Sprintf(`VBoxManage controlvm "%s" poweroff`, v.machineConfig.ID)); err != nil {
 		return errors.Wrap(err, out)

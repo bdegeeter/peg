@@ -162,6 +162,40 @@ func (p *Proxmox) Stop() error {
 	return nil
 }
 
+func (p *Proxmox) HardReset(ctx context.Context) error {
+	if p.vm == nil {
+		return fmt.Errorf("VM not initialized")
+	}
+
+	// Immediate stop (power off, not graceful shutdown)
+	if err := p.vm.Ping(ctx); err != nil {
+		return fmt.Errorf("failed to get VM status: %w", err)
+	}
+
+	if !p.vm.IsStopped() {
+		task, err := p.vm.Stop(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to stop VM %d: %w", p.vmid, err)
+		}
+		if err := task.WaitFor(ctx, proxmoxTaskTimeout); err != nil {
+			return fmt.Errorf("VM stop task failed: %w", err)
+		}
+		log.Infof("VM %d stopped for hard reset", p.vmid)
+	}
+
+	// Start the VM again
+	startTask, err := p.vm.Start(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to start VM %d after hard reset: %w", p.vmid, err)
+	}
+	if err := startTask.WaitFor(ctx, proxmoxTaskTimeout); err != nil {
+		return fmt.Errorf("VM start task failed after hard reset: %w", err)
+	}
+
+	log.Infof("VM %d hard reset complete (stop + start)", p.vmid)
+	return nil
+}
+
 func (p *Proxmox) Clean() error {
 	if p.vm == nil {
 		// Nothing to clean
@@ -331,22 +365,26 @@ func (p *Proxmox) validateConfig(cfg *types.ProxmoxConfig) error {
 	if cfg.Node == "" {
 		return fmt.Errorf("proxmox node is required")
 	}
-	if cfg.TokenID == "" || cfg.TokenSecret == "" {
-		return fmt.Errorf("proxmox tokenID and tokenSecret are required")
+	hasToken := cfg.TokenID != "" && cfg.TokenSecret != ""
+	hasLogin := cfg.Username != "" && cfg.Password != ""
+	if !hasToken && !hasLogin {
+		return fmt.Errorf("proxmox auth required: set tokenID+tokenSecret or username+password")
 	}
 	if cfg.Storage == "" {
 		return fmt.Errorf("proxmox storage is required")
-	}
-	if cfg.Bridge == "" {
-		return fmt.Errorf("proxmox bridge (SDN VNet) is required")
 	}
 	return nil
 }
 
 func (p *Proxmox) initClient(cfg *types.ProxmoxConfig) error {
-	opts := []proxmoxapi.Option{
-		proxmoxapi.WithAPIToken(cfg.TokenID, cfg.TokenSecret),
+	var authOpt proxmoxapi.Option
+	if cfg.Username != "" && cfg.Password != "" {
+		authOpt = proxmoxapi.WithLogins(cfg.Username, cfg.Password)
+	} else {
+		authOpt = proxmoxapi.WithAPIToken(cfg.TokenID, cfg.TokenSecret)
 	}
+
+	opts := []proxmoxapi.Option{authOpt}
 
 	if cfg.InsecureTLS {
 		opts = append(opts, proxmoxapi.WithHTTPClient(&http.Client{
@@ -366,6 +404,10 @@ func (p *Proxmox) initClient(cfg *types.ProxmoxConfig) error {
 // If the API token lacks SDN permissions, it logs a warning and continues
 // rather than failing -- the user has already confirmed the SDN is configured.
 func (p *Proxmox) validateSDN(ctx context.Context, cfg *types.ProxmoxConfig) error {
+	if cfg.Bridge == "" {
+		return nil
+	}
+
 	cluster, err := p.client.Cluster(ctx)
 	if err != nil {
 		log.Warnf("Could not get cluster for SDN validation (will continue anyway): %v", err)
@@ -427,7 +469,14 @@ func (p *Proxmox) buildVMOptions(cfg *types.ProxmoxConfig) []proxmoxapi.VirtualM
 		{Name: "cores", Value: p.machineConfig.CPU},
 		{Name: "cpu", Value: cpuType},
 		{Name: "scsihw", Value: "virtio-scsi-pci"},
-		{Name: "net0", Value: fmt.Sprintf("virtio,bridge=%s", cfg.Bridge)},
+	}
+
+	// Bridge NIC is optional — when using SLIRP-only networking (via Args),
+	// the bridge is omitted so the VM has a single NIC matching the cloud-config.
+	if cfg.Bridge != "" {
+		opts = append(opts, proxmoxapi.VirtualMachineOption{
+			Name: "net0", Value: fmt.Sprintf("virtio,bridge=%s", cfg.Bridge),
+		})
 	}
 
 	// Boot disk from DriveSizes
@@ -477,6 +526,14 @@ func (p *Proxmox) buildVMOptions(cfg *types.ProxmoxConfig) []proxmoxapi.VirtualM
 		Name:  "boot",
 		Value: bootOrder,
 	})
+
+	// Pass custom QEMU args (e.g., SLIRP NAT for port forwarding)
+	if len(p.machineConfig.Args) > 0 {
+		opts = append(opts, proxmoxapi.VirtualMachineOption{
+			Name:  "args",
+			Value: strings.Join(p.machineConfig.Args, " "),
+		})
+	}
 
 	return opts
 }
