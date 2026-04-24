@@ -12,6 +12,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/spectrocloud/peg/pkg/controller"
+	"github.com/spectrocloud/peg/pkg/machine"
 	"github.com/spectrocloud/peg/pkg/machine/types"
 	"go.uber.org/zap/buffer"
 
@@ -53,6 +54,20 @@ func (vm VM) EventuallyConnects(t ...int) {
 
 func (vm VM) Reboot(t ...int) {
 	machineReboot(vm.machine, t...)
+}
+
+// HardPowerCycle SIGKILLs the VM and relaunches it against the same on-disk state, then waits up to sshTimeoutSec for SSH. QEMU backend only.
+func (vm VM) HardPowerCycle(ctx context.Context, sshTimeoutSec int) (context.Context, error) {
+	q, ok := vm.machine.(*machine.QEMU)
+	if !ok {
+		return ctx, errors.Errorf("HardPowerCycle requires QEMU backend, got %T", vm.machine)
+	}
+	newCtx, err := q.HardPowerCycle(ctx)
+	if err != nil {
+		return ctx, err
+	}
+	vm.EventuallyConnects(sshTimeoutSec)
+	return newCtx, nil
 }
 
 func (vm VM) DetachCD() error {
