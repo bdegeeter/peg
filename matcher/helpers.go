@@ -19,6 +19,11 @@ import (
 	. "github.com/onsi/gomega" //nolint:revive
 )
 
+// LogDir is where gathered logs are written. Relative paths resolve against the
+// process working directory. Defaults to "logs" to preserve historical behavior;
+// set an absolute path to write gathered logs elsewhere.
+var LogDir = "logs"
+
 type VM struct {
 	machine    types.Machine
 	cancelFunc context.CancelFunc // We call it when we `Destroy` the VM
@@ -182,9 +187,9 @@ func machineGatherLog(m types.Machine, logPath string) {
 	}
 
 	baseName := filepath.Base(logPath)
-	_ = os.Mkdir("logs", 0755)
+	_ = os.MkdirAll(LogDir, 0o755)
 
-	f, _ := os.Create(fmt.Sprintf("logs/%s", baseName))
+	f, _ := os.Create(filepath.Join(LogDir, baseName))
 	// Close the file after it has been copied
 	// Close client connection after the file has been copied
 	defer scpClient.Close()
@@ -198,7 +203,7 @@ func machineGatherLog(m types.Machine, logPath string) {
 		return
 	}
 	// Change perms so its world readable
-	_ = os.Chmod(fmt.Sprintf("logs/%s", baseName), 0666)
+	_ = os.Chmod(filepath.Join(LogDir, baseName), 0o666)
 	fmt.Printf("File %s copied!\n", baseName)
 }
 
