@@ -35,6 +35,17 @@ func (vm VM) HasFile(s string) {
 	machineHasFile(vm.machine, s)
 }
 
+// SSHPort returns the host-side port QEMU forwards to the guest's
+// sshd. Callers that need to reach the guest independently of the VM
+// helpers (e.g. running a compliance tool over SSH directly from the
+// runner) use this. Empty string if the machine has no SSH config.
+func (vm VM) SSHPort() string {
+	if s := vm.machine.Config().SSH; s != nil {
+		return s.Port
+	}
+	return ""
+}
+
 func (vm VM) Sudo(s string) (string, error) {
 	return machineSudo(vm.machine, s)
 }
