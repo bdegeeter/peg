@@ -3,6 +3,7 @@ package matcher
 import (
 	"bytes"
 	"context"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,6 +18,15 @@ import (
 
 	. "github.com/onsi/gomega" //nolint:revive
 )
+
+// LogDir is where gathered logs are written. Relative paths resolve against the
+// process working directory. Defaults to "logs" to preserve historical behavior;
+// set an absolute path to write gathered logs elsewhere.
+var LogDir = "logs"
+
+type hardResetter interface {
+	HardReset(context.Context) (context.Context, error)
+}
 
 type VM struct {
 	machine    types.Machine
@@ -46,6 +56,14 @@ func (vm VM) SSHPort() string {
 	return ""
 }
 
+// Engine returns the backend managing the VM.
+func (vm VM) Engine() types.Engine {
+	if vm.machine == nil {
+		return ""
+	}
+	return vm.machine.Config().Engine
+}
+
 func (vm VM) Sudo(s string) (string, error) {
 	return machineSudo(vm.machine, s)
 }
@@ -64,6 +82,27 @@ func (vm VM) EventuallyConnects(t ...int) {
 
 func (vm VM) Reboot(t ...int) {
 	machineReboot(vm.machine, t...)
+}
+
+// HardPowerCycle abruptly power cycles a capable backend and waits up to
+// sshTimeoutSec for SSH to become available again.
+func (vm *VM) HardPowerCycle(ctx context.Context, sshTimeoutSec int) (context.Context, error) {
+	resetter, ok := vm.machine.(hardResetter)
+	if !ok {
+		return ctx, fmt.Errorf("hard power cycle is not supported by %T", vm.machine)
+	}
+	if vm.cancelFunc != nil {
+		vm.cancelFunc()
+	}
+	resetCtx, cancelReset := context.WithCancel(ctx)
+	vm.cancelFunc = cancelReset
+	newCtx, err := resetter.HardReset(resetCtx)
+	if err != nil {
+		cancelReset()
+		return ctx, err
+	}
+	vm.EventuallyConnects(sshTimeoutSec)
+	return newCtx, nil
 }
 
 func (vm VM) DetachCD() error {
@@ -101,18 +140,21 @@ func (vm VM) Destroy(additionalCleanup func(vm VM)) error {
 	// before the ctx.Done() is read, resulting in the Fail function to be called.
 	time.Sleep(time.Second * 1)
 
-	// Stop VM and cleanup state dir
+	// Stop VM and cleanup state dir.
+	var cleanupErrors []error
 	if vm.machine != nil {
 		if err := vm.machine.Stop(); err != nil {
 			fmt.Printf("Failed to stop the machine: %s\n", err.Error())
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("stop machine: %w", err))
 		}
 
 		if err := vm.machine.Clean(); err != nil {
 			fmt.Printf("Failed to cleanup: %s\n", err.Error())
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("clean machine: %w", err))
 		}
 	}
 
-	return nil
+	return stderrors.Join(cleanupErrors...)
 }
 
 var Machine types.Machine
@@ -178,9 +220,9 @@ func machineGatherLog(m types.Machine, logPath string) {
 	}
 
 	baseName := filepath.Base(logPath)
-	_ = os.Mkdir("logs", 0755)
+	_ = os.MkdirAll(LogDir, 0o755)
 
-	f, _ := os.Create(fmt.Sprintf("logs/%s", baseName))
+	f, _ := os.Create(filepath.Join(LogDir, baseName))
 	// Close the file after it has been copied
 	// Close client connection after the file has been copied
 	defer scpClient.Close()
@@ -194,7 +236,7 @@ func machineGatherLog(m types.Machine, logPath string) {
 		return
 	}
 	// Change perms so its world readable
-	_ = os.Chmod(fmt.Sprintf("logs/%s", baseName), 0666)
+	_ = os.Chmod(filepath.Join(LogDir, baseName), 0o666)
 	fmt.Printf("File %s copied!\n", baseName)
 }
 
