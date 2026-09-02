@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codingsince1985/checksum"
 	proxmoxapi "github.com/luthermonson/go-proxmox"
 	process "github.com/mudler/go-processmanager"
 	"github.com/spectrocloud/peg/pkg/machine/types"
@@ -198,53 +198,6 @@ func TestProxmoxLoginAuthentication(t *testing.T) {
 	}
 }
 
-func TestProxmoxAPIEndpoint(t *testing.T) {
-	for input, want := range map[string]string{
-		"https://pve.example/api2/json":        "pve.example:8006",
-		"https://pve.example:9443/api2/json":   "pve.example:9443",
-		"https://[2001:db8::1]/api2/json":      "[2001:db8::1]:8006",
-		"https://[2001:db8::1]:9443/api2/json": "[2001:db8::1]:9443",
-	} {
-		got, err := proxmoxAPIEndpoint(input)
-		if err != nil || got != want {
-			t.Errorf("proxmoxAPIEndpoint(%q) = %q, %v; want %q", input, got, err, want)
-		}
-	}
-}
-
-func TestServeISO(t *testing.T) {
-	isoPath := filepath.Join(t.TempDir(), "image with spaces.iso")
-	want := []byte("iso contents")
-	if err := os.WriteFile(isoPath, want, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	serveURL, shutdown, err := serveISO(isoPath, "127.0.0.1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = shutdown() })
-
-	response, err := http.Get(serveURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := io.ReadAll(response.Body)
-	_ = response.Body.Close()
-	if err != nil || !bytes.Equal(got, want) {
-		t.Fatalf("GET ISO = %q, %v; want %q", got, err, want)
-	}
-
-	request, _ := http.NewRequest(http.MethodPost, serveURL, nil)
-	response, err = http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = response.Body.Close()
-	if response.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("POST status = %d, want %d", response.StatusCode, http.StatusMethodNotAllowed)
-	}
-}
-
 func TestProxmoxISOModesAndCollisions(t *testing.T) {
 	if !isProxmoxStorageRef("local:iso/image.iso") || isProxmoxStorageRef("https://example.test/image.iso") {
 		t.Fatal("storage-reference ISO detection returned an unexpected result")
@@ -281,6 +234,142 @@ func TestProxmoxISOModesAndCollisions(t *testing.T) {
 	secondName := proxmoxURLISOName("https://example.test/two/image.iso", "/two/image.iso")
 	if firstName == secondName || !strings.HasPrefix(firstName, "peg-") {
 		t.Fatalf("URL ISO names are not Peg-owned and URL-addressed: %q, %q", firstName, secondName)
+	}
+}
+
+func TestTransferLocalISOUsesAuthenticatedUpload(t *testing.T) {
+	previousInterval := proxmoxapi.DefaultWaitInterval
+	proxmoxapi.DefaultWaitInterval = time.Millisecond
+	t.Cleanup(func() { proxmoxapi.DefaultWaitInterval = previousInterval })
+
+	isoContents := []byte("iso contents")
+	isoPath := filepath.Join(t.TempDir(), "uds-os.iso")
+	if err := os.WriteFile(isoPath, isoContents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sha256sum, err := checksum.SHA256sum(isoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantFilename := fmt.Sprintf("peg-%s-uds-os.iso", sha256sum[:12])
+	var uploaded bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := strings.TrimPrefix(r.URL.Path, "/api2/json")
+		switch {
+		case r.Method == http.MethodGet && path == "/nodes/pve/status":
+			fmt.Fprint(w, `{"data":{}}`)
+		case r.Method == http.MethodGet && path == "/nodes/pve/storage/local/status":
+			fmt.Fprint(w, `{"data":{}}`)
+		case r.Method == http.MethodGet && path == "/nodes/pve/storage/local/content":
+			if uploaded {
+				fmt.Fprintf(w, `{"data":[{"volid":"local:iso/%s","size":%d}]}`, wantFilename, len(isoContents))
+			} else {
+				fmt.Fprint(w, `{"data":[]}`)
+			}
+		case r.Method == http.MethodPost && path == "/nodes/pve/storage/local/upload":
+			if got := r.Header.Get("Authorization"); got != "PVEAPIToken=peg@pam!test=secret" {
+				t.Errorf("Authorization = %q", got)
+			}
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				t.Errorf("parse multipart upload: %v", err)
+				http.Error(w, "bad upload", http.StatusBadRequest)
+				return
+			}
+			if got := r.FormValue("content"); got != "iso" {
+				t.Errorf("content = %q, want iso", got)
+			}
+			if values := r.MultipartForm.Value["filename"]; len(values) != 0 {
+				t.Errorf("unexpected scalar filename field = %#v", values)
+			}
+			files := r.MultipartForm.File["filename"]
+			if len(files) != 1 {
+				t.Errorf("uploaded files = %d, want 1", len(files))
+			} else if files[0].Filename != wantFilename {
+				t.Errorf("uploaded filename = %q, want %q", files[0].Filename, wantFilename)
+			}
+			uploaded = true
+			fmt.Fprint(w, `{"data":"UPID:pve:1:1:1:imgcopy:iso:root@pam:"}`)
+		case r.Method == http.MethodGet && strings.Contains(path, "/tasks/UPID:pve:1:1:1:imgcopy:iso:root@pam:/status"):
+			fmt.Fprint(w, taskStatusJSON("UPID:pve:1:1:1:imgcopy:iso:root@pam:", "imgcopy"))
+		default:
+			http.Error(w, "unexpected request: "+r.Method+" "+path, http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	cfg := validProxmoxConfig()
+	cfg.APIURL = server.URL + "/api2/json"
+	p := &Proxmox{machineConfig: types.MachineConfig{ID: "iso", ISO: isoPath}}
+	if err := p.initClient(cfg); err != nil {
+		t.Fatal(err)
+	}
+	node, err := p.client.Node(context.Background(), "pve")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.node = node
+	if err := p.transferLocalISO(context.Background(), cfg, isoPath, "local"); err != nil {
+		t.Fatal(err)
+	}
+	if !uploaded || p.machineConfig.ISO != "local:iso/"+wantFilename {
+		t.Fatalf("uploaded = %t, ISO = %q", uploaded, p.machineConfig.ISO)
+	}
+}
+
+func TestStageProxmoxISOUsesRequestedFilenameWithoutCopying(t *testing.T) {
+	isoContents := []byte("iso contents")
+	isoPath := filepath.Join(t.TempDir(), "local-name.iso")
+	if err := os.WriteFile(isoPath, isoContents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stagedPath, cleanup, err := stageProxmoxISO(isoPath, "remote-name.iso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageDir := filepath.Dir(stagedPath)
+	t.Cleanup(cleanup)
+
+	if got := filepath.Base(stagedPath); got != "remote-name.iso" {
+		t.Fatalf("staged basename = %q, want remote-name.iso", got)
+	}
+	info, err := os.Lstat(stagedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("staged ISO is not a symlink")
+	}
+	got, err := os.ReadFile(stagedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, isoContents) {
+		t.Fatalf("staged ISO contents = %q, want %q", got, isoContents)
+	}
+
+	cleanup()
+	if _, err := os.Stat(stageDir); !os.IsNotExist(err) {
+		t.Fatalf("temporary upload directory still exists: %v", err)
+	}
+}
+
+func TestWaitForSuccessfulProxmoxTaskRejectsFailedExitStatus(t *testing.T) {
+	previousInterval := proxmoxapi.DefaultWaitInterval
+	proxmoxapi.DefaultWaitInterval = time.Millisecond
+	t.Cleanup(func() { proxmoxapi.DefaultWaitInterval = previousInterval })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":{"UPID":"UPID:pve:1:1:1:imgcopy:iso:root@pam:","Node":"pve","Type":"imgcopy","Status":"stopped","ExitStatus":"upload failed"}}`)
+	}))
+	defer server.Close()
+	client := proxmoxapi.NewClient(server.URL, proxmoxapi.WithAPIToken("peg@pam!test", "secret"))
+	task := proxmoxapi.NewTask("UPID:pve:1:1:1:imgcopy:iso:root@pam:", client)
+	err := waitForSuccessfulProxmoxTask(context.Background(), task, 1, "ISO upload")
+	if err == nil || !strings.Contains(err.Error(), "upload failed") {
+		t.Fatalf("waitForSuccessfulProxmoxTask() error = %v", err)
 	}
 }
 

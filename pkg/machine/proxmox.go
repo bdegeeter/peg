@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -683,18 +682,6 @@ func nextFreeSCSIIndex(config *proxmoxapi.VirtualMachineConfig) (int, error) {
 		}
 	}
 	return 0, fmt.Errorf("virtual machine has no free SCSI slots")
-}
-
-func proxmoxAPIEndpoint(apiURL string) (string, error) {
-	parsed, err := url.Parse(apiURL)
-	if err != nil || parsed.Hostname() == "" {
-		return "", fmt.Errorf("invalid Proxmox API URL %q", apiURL)
-	}
-	port := parsed.Port()
-	if port == "" {
-		port = "8006"
-	}
-	return net.JoinHostPort(parsed.Hostname(), port), nil
 }
 
 func (p *Proxmox) rollbackVM(ctx context.Context) error {

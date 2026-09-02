@@ -3,16 +3,11 @@ package machine
 import (
 	"context"
 	"crypto/sha256"
-	"errors"
 	"fmt"
-	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/codingsince1985/checksum"
 	proxmoxapi "github.com/luthermonson/go-proxmox"
@@ -62,8 +57,8 @@ func (p *Proxmox) prepareISO(ctx context.Context, cfg *types.ProxmoxConfig) erro
 		return p.downloadURLToProxmox(ctx, cfg, iso, isoStorage)
 	}
 
-	// Local file path — serve via temp HTTP server and use StorageDownloadURL
-	log.Infof("ISO is a local file, transferring to Proxmox: %s", iso)
+	// Local file path — upload directly through the authenticated Proxmox API.
+	log.Infof("ISO is a local file, preparing Proxmox upload: %s", iso)
 	return p.transferLocalISO(ctx, cfg, iso, isoStorage)
 }
 
@@ -99,8 +94,8 @@ func (p *Proxmox) downloadURLToProxmox(ctx context.Context, cfg *types.ProxmoxCo
 	}
 
 	task := proxmoxapi.NewTask(proxmoxapi.UPID(upid), p.client)
-	if err := task.WaitFor(ctx, isoTransferTimeout); err != nil {
-		return fmt.Errorf("ISO download task failed: %w", err)
+	if err := waitForSuccessfulProxmoxTask(ctx, task, isoTransferTimeout, "ISO download"); err != nil {
+		return err
 	}
 
 	p.machineConfig.ISO = fmt.Sprintf("%s:iso/%s", isoStorage, filename)
@@ -108,8 +103,7 @@ func (p *Proxmox) downloadURLToProxmox(ctx context.Context, cfg *types.ProxmoxCo
 	return nil
 }
 
-// transferLocalISO serves a local ISO file via a temporary HTTP server and
-// directs Proxmox to download it via StorageDownloadURL.
+// transferLocalISO streams a local ISO through Proxmox's authenticated upload API.
 func (p *Proxmox) transferLocalISO(ctx context.Context, cfg *types.ProxmoxConfig, isoPath, isoStorage string) error {
 	// Validate the local file exists
 	fi, err := os.Stat(isoPath)
@@ -134,54 +128,86 @@ func (p *Proxmox) transferLocalISO(ctx context.Context, cfg *types.ProxmoxConfig
 		p.machineConfig.ISO = fmt.Sprintf("%s:iso/%s", isoStorage, filename)
 		return nil
 	}
+	log.Infof("Uploading ISO to Proxmox storage %q: %s (%d bytes, %.2f GiB)",
+		isoStorage, isoPath, fi.Size(), float64(fi.Size())/(1024*1024*1024))
 
-	// Detect the local IP that can reach the Proxmox host
-	apiEndpoint, err := proxmoxAPIEndpoint(cfg.APIURL)
+	stagedISOPath, cleanup, err := stageProxmoxISO(isoPath, filename)
 	if err != nil {
+		return fmt.Errorf("failed to stage ISO for Proxmox upload: %w", err)
+	}
+	defer cleanup()
+
+	storage, err := p.node.Storage(ctx, isoStorage)
+	if err != nil {
+		return fmt.Errorf("failed to get storage %q for ISO upload: %w", isoStorage, err)
+	}
+	task, err := storage.Upload("iso", stagedISOPath)
+	if err != nil {
+		return fmt.Errorf("failed to upload ISO through Proxmox API: %w", err)
+	}
+	if err := waitForSuccessfulProxmoxTask(ctx, task, isoTransferTimeout, "ISO upload"); err != nil {
 		return err
 	}
-	localIP, err := detectLocalIP(apiEndpoint)
+	exists, err = p.isoExistsOnStorage(ctx, isoStorage, filename, fi.Size())
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to verify uploaded ISO: %w", err)
 	}
-	log.Infof("Detected local IP reachable from Proxmox: %s", localIP)
-
-	// Start temporary HTTP server
-	serveURL, shutdown, err := serveISO(isoPath, localIP)
-	if err != nil {
-		return fmt.Errorf("failed to start temp HTTP server: %w", err)
-	}
-	defer func() {
-		if err := shutdown(); err != nil {
-			log.Warnf("Failed to stop temporary ISO server: %v", err)
-		}
-	}()
-	log.Infof("SHA256: %s", sha256sum)
-
-	// Tell Proxmox to download from our temp HTTP server
-	opts := &proxmoxapi.StorageDownloadURLOptions{
-		Content:           "iso",
-		Filename:          filename,
-		Storage:           isoStorage,
-		URL:               serveURL,
-		Checksum:          sha256sum,
-		ChecksumAlgorithm: "sha256",
-		Node:              cfg.Node,
-	}
-
-	upid, err := p.node.StorageDownloadURL(ctx, opts)
-	if err != nil {
-		return fmt.Errorf("StorageDownloadURL failed: %w", err)
-	}
-
-	log.Infof("Proxmox downloading ISO from %s (task: %s)", serveURL, upid)
-	task := proxmoxapi.NewTask(proxmoxapi.UPID(upid), p.client)
-	if err := task.WaitFor(ctx, isoTransferTimeout); err != nil {
-		return fmt.Errorf("ISO download task failed: %w", err)
+	if !exists {
+		return fmt.Errorf("uploaded ISO %q was not found on storage %q", filename, isoStorage)
 	}
 
 	p.machineConfig.ISO = fmt.Sprintf("%s:iso/%s", isoStorage, filename)
-	log.Infof("ISO transferred to Proxmox storage: %s", p.machineConfig.ISO)
+	log.Infof("ISO uploaded to Proxmox storage: %s (SHA256: %s)", p.machineConfig.ISO, sha256sum)
+	return nil
+}
+
+// stageProxmoxISO creates a temporary alias whose basename becomes the
+// multipart upload filename. go-proxmox's UploadWithName sends the requested
+// name as a second scalar "filename" field, which the Proxmox upload endpoint
+// does not accept. Upload derives the remote name from the opened file instead.
+func stageProxmoxISO(isoPath, filename string) (string, func(), error) {
+	absISOPath, err := filepath.Abs(isoPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to resolve ISO path: %w", err)
+	}
+
+	stageDir, err := os.MkdirTemp("", "peg-proxmox-upload-")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create temporary upload directory: %w", err)
+	}
+	cleanup := func() {
+		if err := os.RemoveAll(stageDir); err != nil {
+			log.Warnf("Failed to clean up temporary Proxmox upload directory %q: %v", stageDir, err)
+		}
+	}
+
+	stagedISOPath := filepath.Join(stageDir, filename)
+	if err := os.Symlink(absISOPath, stagedISOPath); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("failed to create temporary ISO alias: %w", err)
+	}
+
+	return stagedISOPath, cleanup, nil
+}
+
+func waitForSuccessfulProxmoxTask(ctx context.Context, task *proxmoxapi.Task, timeoutSeconds int, operation string) error {
+	if task == nil {
+		return fmt.Errorf("%s did not return a Proxmox task", operation)
+	}
+	successful, completed, err := task.WaitForCompleteStatus(ctx, timeoutSeconds)
+	if err != nil {
+		return fmt.Errorf("%s task failed: %w", operation, err)
+	}
+	if !completed {
+		return fmt.Errorf("%s task did not complete within %d seconds", operation, timeoutSeconds)
+	}
+	if !successful {
+		exitStatus := task.ExitStatus
+		if exitStatus == "" {
+			exitStatus = task.Status
+		}
+		return fmt.Errorf("%s task completed unsuccessfully: %s", operation, exitStatus)
+	}
 	return nil
 }
 
@@ -213,56 +239,6 @@ func pegISOExists(contents []*proxmoxapi.StorageContent, storageName, filename s
 		return false, fmt.Errorf("ISO %q exists with unexpected size (local: %d, remote: %d); refusing to delete it", filename, localSize, remoteSize)
 	}
 	return false, nil
-}
-
-// detectLocalIP finds the local IP address that routes to the Proxmox API.
-func detectLocalIP(apiEndpoint string) (string, error) {
-	conn, err := net.DialTimeout("tcp", apiEndpoint, 5*time.Second)
-	if err != nil {
-		return "", fmt.Errorf("failed to detect local IP reachable from Proxmox API %s: %w", apiEndpoint, err)
-	}
-	defer conn.Close()
-
-	localAddr := conn.LocalAddr().(*net.TCPAddr)
-	return localAddr.IP.String(), nil
-}
-
-// serveISO starts a temporary HTTP server that serves a single ISO file.
-// It returns the full URL to the file and a shutdown function.
-func serveISO(filePath, bindIP string) (url string, shutdown func() error, err error) {
-	listener, err := net.Listen("tcp", net.JoinHostPort(bindIP, "0"))
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to bind temp HTTP server: %w", err)
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/iso", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			w.Header().Set("Allow", "GET, HEAD")
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		log.Infof("Serving ISO to %s", r.RemoteAddr)
-		http.ServeFile(w, r, filePath)
-	})
-
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	go func() {
-		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Errorf("Temporary ISO server failed: %v", err)
-		}
-	}()
-
-	addr := listener.Addr().(*net.TCPAddr)
-	url = "http://" + net.JoinHostPort(addr.IP.String(), strconv.Itoa(addr.Port)) + "/iso"
-	shutdown = func() error {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return srv.Shutdown(ctx)
-	}
-
-	log.Infof("Temp HTTP server listening at %s", url)
-	return url, shutdown, nil
 }
 
 // parseChecksum splits a checksum string like "sha256:abc123" into algorithm and hash.
