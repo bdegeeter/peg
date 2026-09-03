@@ -41,6 +41,7 @@ func TestProxmoxMachineOptions(t *testing.T) {
 	cfg := DefaultMachineConfig()
 	err := cfg.Apply(
 		ProxmoxEngine,
+		WithProxmoxVMID(100),
 		WithSSHHost("pve.example.test"),
 		WithProxmoxAPIURL("https://pve.example.test:8006/api2/json"),
 		WithProxmoxNode("pve"),
@@ -59,7 +60,7 @@ func TestProxmoxMachineOptions(t *testing.T) {
 	if cfg.Engine != Proxmox || cfg.SSH.Host != "pve.example.test" || cfg.Proxmox == nil {
 		t.Fatalf("unexpected machine config: %#v", cfg)
 	}
-	if cfg.Proxmox.ISOStorage != "local" || cfg.Proxmox.RNGSource != "/dev/urandom" || !cfg.Proxmox.InsecureTLS {
+	if cfg.Proxmox.VMID != 100 || cfg.Proxmox.ISOStorage != "local" || cfg.Proxmox.RNGSource != "/dev/urandom" || !cfg.Proxmox.InsecureTLS {
 		t.Fatalf("unexpected Proxmox options: %#v", cfg.Proxmox)
 	}
 }

@@ -55,6 +55,7 @@ type MachineConfig struct {
 // Authentication: use either TokenID+TokenSecret (API token) or Username+Password (root login).
 // Root login is required for VM features like custom QEMU args.
 type ProxmoxConfig struct {
+	VMID        int    `yaml:"vmID,omitempty"`
 	APIURL      string `yaml:"apiURL,omitempty"`
 	Node        string `yaml:"node,omitempty"`
 	TokenID     string `yaml:"tokenID,omitempty"`
@@ -339,6 +340,19 @@ func WithProxmoxAPIURL(url string) MachineOption {
 		}
 		if url != "" {
 			mc.Proxmox.APIURL = url
+		}
+		return nil
+	}
+}
+
+// WithProxmoxVMID selects an existing Proxmox VM.
+func WithProxmoxVMID(vmid int) MachineOption {
+	return func(mc *MachineConfig) error {
+		if mc.Proxmox == nil {
+			mc.Proxmox = &ProxmoxConfig{}
+		}
+		if vmid > 0 {
+			mc.Proxmox.VMID = vmid
 		}
 		return nil
 	}

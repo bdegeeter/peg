@@ -90,6 +90,7 @@ func (p *Proxmox) Create(ctx context.Context) (resultCtx context.Context, result
 		return ctx, fmt.Errorf("failed to get next VMID: %w", err)
 	}
 	p.vmid = vmid
+	cfg.VMID = vmid
 
 	log.Infof("Creating Proxmox VM %d on node %s [ Memory: %s, CPU: %s ]",
 		vmid, cfg.Node, p.machineConfig.Memory, p.machineConfig.CPU)
@@ -146,6 +147,42 @@ func (p *Proxmox) Create(ctx context.Context) (resultCtx context.Context, result
 	newCtx := p.monitorVM(ctx)
 
 	return newCtx, nil
+}
+
+func (p *Proxmox) attach(ctx context.Context) error {
+	cfg := p.machineConfig.Proxmox
+	if cfg == nil || cfg.VMID <= 0 {
+		return fmt.Errorf("proxmox VMID is required")
+	}
+	if err := p.validateConfig(cfg); err != nil {
+		return fmt.Errorf("invalid proxmox configuration: %w", err)
+	}
+	if err := p.initClient(cfg); err != nil {
+		return fmt.Errorf("failed to initialize proxmox client: %w", err)
+	}
+	node, err := p.client.Node(ctx, cfg.Node)
+	if err != nil {
+		return fmt.Errorf("failed to get proxmox node %q: %w", cfg.Node, err)
+	}
+	p.node = node
+	p.vm, err = node.VirtualMachine(ctx, cfg.VMID)
+	if err != nil {
+		if proxmoxapi.IsNotFound(err) {
+			return fmt.Errorf("%w: Proxmox VM %d", ErrMachineNotFound, cfg.VMID)
+		}
+		return fmt.Errorf("failed to get Proxmox VM %d: %w", cfg.VMID, err)
+	}
+	p.vmid = cfg.VMID
+
+	expectedName := "peg-" + p.machineConfig.ID
+	actualName := p.vm.Name
+	if actualName == "" && p.vm.VirtualMachineConfig != nil {
+		actualName = p.vm.VirtualMachineConfig.Name
+	}
+	if actualName != expectedName {
+		return fmt.Errorf("Proxmox VM %d name %q does not match %q", cfg.VMID, actualName, expectedName)
+	}
+	return nil
 }
 
 func (p *Proxmox) Stop() error {

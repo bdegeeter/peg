@@ -3,6 +3,7 @@ package machine
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,6 +20,9 @@ import (
 )
 
 var log = logging.Logger("machine")
+
+// ErrMachineNotFound indicates that an attached machine no longer exists.
+var ErrMachineNotFound = errors.New("machine not found")
 
 func checksumErr(got, expected string) error {
 	return fmt.Errorf("checksum mismatch: got %s, expected %s", got, expected)
@@ -208,6 +212,22 @@ func New(opts ...types.MachineOption) (types.Machine, error) {
 	}
 
 	return nil, fmt.Errorf("invalid engine: %s, obj: %+v", mc.Engine, mc)
+}
+
+// Attach connects to an existing Proxmox machine configured by VMID.
+func Attach(ctx context.Context, opts ...types.MachineOption) (types.Machine, error) {
+	m, err := New(opts...)
+	if err != nil {
+		return nil, err
+	}
+	p, ok := m.(*Proxmox)
+	if !ok {
+		return nil, fmt.Errorf("attach is only supported for the Proxmox engine")
+	}
+	if err := p.attach(ctx); err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")

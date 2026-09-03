@@ -578,6 +578,41 @@ func TestMonitorVMToleratesTransientPingFailures(t *testing.T) {
 	}
 }
 
+func TestAttachProxmoxMachine(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := strings.TrimPrefix(r.URL.Path, "/api2/json")
+		switch {
+		case r.Method == http.MethodGet && path == "/nodes/pve/status":
+			fmt.Fprint(w, `{"data":{}}`)
+		case r.Method == http.MethodGet && path == "/nodes/pve/qemu/100/status/current":
+			fmt.Fprint(w, `{"data":{"name":"peg-existing","node":"pve","vmid":100,"status":"running"}}`)
+		case r.Method == http.MethodGet && path == "/nodes/pve/qemu/100/config":
+			fmt.Fprint(w, `{"data":{"name":"peg-existing"}}`)
+		default:
+			http.Error(w, "unexpected request: "+r.Method+" "+path, http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	m, err := Attach(context.Background(),
+		types.ProxmoxEngine,
+		types.WithID("existing"),
+		types.WithProxmoxVMID(100),
+		types.WithProxmoxAPIURL(server.URL+"/api2/json"),
+		types.WithProxmoxNode("pve"),
+		types.WithProxmoxTokenID("peg@pam!test"),
+		types.WithProxmoxTokenSecret("secret"),
+		types.WithProxmoxStorage("local-lvm"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Config().Proxmox.VMID != 100 {
+		t.Fatalf("attached VMID = %d, want 100", m.Config().Proxmox.VMID)
+	}
+}
+
 func TestProxmoxLifecycle(t *testing.T) {
 	previousInterval := proxmoxapi.DefaultWaitInterval
 	proxmoxapi.DefaultWaitInterval = time.Millisecond
